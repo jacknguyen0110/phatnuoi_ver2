@@ -41,4 +41,4 @@ RUN playwright install chromium
 
 COPY . .
 
-CMD gunicorn -b 0.0.0.0:${PORT:-8080} main:app --workers 1 --threads 2 --timeout 180
+CMD gunicorn -b 0.0.0.0:${PORT:-8080} main:app --workers 1 --threads 4 --timeout 180
