@@ -5,6 +5,7 @@ import time
 import queue
 import logging
 import threading
+import tempfile
 from datetime import datetime
 
 import requests
@@ -13,7 +14,6 @@ from flask import Flask, request, jsonify
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
-from playwright.sync_api import sync_playwright
 
 
 APP_NAME = "Tra cứu phạt nguội bot"
@@ -25,6 +25,7 @@ GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "").strip()
 GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "Phạt Nguội").strip()
 GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "").strip()
+SCRAPER_API_URL = os.getenv("SCRAPER_API_URL", "").strip()  # ví dụ: https://abc.ngrok-free.app
 PORT = int(os.getenv("PORT", "8080"))
 
 if not TELEGRAM_BOT_TOKEN:
@@ -35,6 +36,8 @@ if not GOOGLE_SHEET_ID:
     raise RuntimeError("Thiếu GOOGLE_SHEET_ID")
 if not GOOGLE_DRIVE_FOLDER_ID:
     raise RuntimeError("Thiếu GOOGLE_DRIVE_FOLDER_ID")
+if not SCRAPER_API_URL:
+    raise RuntimeError("Thiếu SCRAPER_API_URL")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
@@ -143,10 +146,6 @@ def chunk_text(text: str, size: int = 3500):
 def safe_filename(text: str):
     text = re.sub(r"[^A-Za-z0-9._-]+", "_", text or "")
     return text[:150].strip("_") or "file"
-
-
-def normalize_spaces(s: str) -> str:
-    return re.sub(r"[ \t]+", " ", (s or "").strip())
 
 
 def tg_send_message(chat_id, text):
@@ -263,159 +262,45 @@ def upload_file_to_drive(local_path: str, filename: str):
     return info.get("webViewLink", "")
 
 
-def extract_blocks_from_text(page_text: str):
-    text = page_text or ""
-    start = text.find("Biển số:")
-    if start == -1:
-        return []
+def upload_screenshot_from_local_path(local_screenshot_path: str, plate: str):
+    if not local_screenshot_path or not os.path.exists(local_screenshot_path):
+        return ""
 
-    text = text[start:]
-    parts = re.split(r"(?=Biển số:\s*)", text)
-    blocks = []
-
-    for part in parts:
-        part = part.strip()
-        if not part:
-            continue
-        if (
-            "Loại xe:" in part
-            or "Chi tiết vi phạm" in part
-            or "Thông tin xử lý" in part
-            or "Lỗi vi phạm:" in part
-        ):
-            blocks.append(part)
-
-    return blocks
+    filename = f"{safe_filename(plate)}_{int(time.time())}.png"
+    return upload_file_to_drive(local_screenshot_path, filename)
 
 
-def parse_block(block_text: str):
-    lines = [x.strip() for x in block_text.splitlines() if x.strip()]
-    data = {
-        "plate_display": "",
-        "result_status": "",
-        "vehicle_type": "",
-        "plate_color": "",
-        "violation_code": "",
-        "violation_text": "",
-        "violation_time": "",
-        "violation_location": "",
-        "detected_by": "",
-        "detected_address": "",
-        "detected_phone": "",
-        "resolved_by": "",
-        "resolved_address": "",
-        "resolved_phone": "",
-        "screenshot_url": "",
-        "debug_note": "",
-    }
+def upload_screenshot_from_url(file_url: str, plate: str):
+    if not file_url:
+        return ""
 
-    current = None
-    side = None
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
+        tmp_path = tmp.name
 
-    for line in lines:
-        raw = normalize_spaces(line)
+    try:
+        r = requests.get(file_url, timeout=120)
+        r.raise_for_status()
+        with open(tmp_path, "wb") as f:
+            f.write(r.content)
 
-        if raw.startswith("Biển số:"):
-            data["plate_display"] = raw.replace("Biển số:", "", 1).strip()
-            current = "plate_display"
-            continue
-
-        if raw in ("Đã xử phạt", "Chưa xử phạt"):
-            data["result_status"] = raw
-            current = "result_status"
-            continue
-
-        if raw.startswith("Loại xe:"):
-            data["vehicle_type"] = raw.replace("Loại xe:", "", 1).strip()
-            current = "vehicle_type"
-            continue
-
-        if raw.startswith("Màu biển:"):
-            data["plate_color"] = raw.replace("Màu biển:", "", 1).strip()
-            current = "plate_color"
-            continue
-
-        if raw.startswith("Lỗi vi phạm:"):
-            detail = raw.replace("Lỗi vi phạm:", "", 1).strip()
-            m = re.match(r"^([A-Za-z0-9\.\-\/]+)\s*(.*)$", detail)
-            if m:
-                data["violation_code"] = m.group(1).strip()
-                data["violation_text"] = m.group(2).strip()
-            else:
-                data["violation_text"] = detail
-            current = "violation_text"
-            continue
-
-        if raw.startswith("Thời gian:"):
-            data["violation_time"] = raw.replace("Thời gian:", "", 1).strip()
-            current = "violation_time"
-            continue
-
-        if raw.startswith("Địa điểm:"):
-            data["violation_location"] = raw.replace("Địa điểm:", "", 1).strip()
-            current = "violation_location"
-            continue
-
-        if raw.startswith("Đơn vị phát hiện:"):
-            side = "detected"
-            data["detected_by"] = raw.replace("Đơn vị phát hiện:", "", 1).strip()
-            current = "detected_by"
-            continue
-
-        if raw.startswith("Đơn vị giải quyết:"):
-            side = "resolved"
-            data["resolved_by"] = raw.replace("Đơn vị giải quyết:", "", 1).strip()
-            current = "resolved_by"
-            continue
-
-        if raw.startswith("Địa chỉ:"):
-            v = raw.replace("Địa chỉ:", "", 1).strip()
-            if side == "detected":
-                data["detected_address"] = v
-                current = "detected_address"
-            elif side == "resolved":
-                data["resolved_address"] = v
-                current = "resolved_address"
-            continue
-
-        if raw.startswith("Điện thoại:"):
-            v = raw.replace("Điện thoại:", "", 1).strip()
-            if side == "detected":
-                data["detected_phone"] = v
-                current = "detected_phone"
-            elif side == "resolved":
-                data["resolved_phone"] = v
-                current = "resolved_phone"
-            continue
-
-        if current and data.get(current):
-            data[current] += " " + raw
-
-    if not data["result_status"]:
-        data["result_status"] = "CO_VI_PHAM"
-
-    return data
+        filename = f"{safe_filename(plate)}_{int(time.time())}.png"
+        return upload_file_to_drive(tmp_path, filename)
+    finally:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
 
 
-def build_no_violation_record(plate, screenshot_url="", debug_note=""):
-    return {
-        "plate_display": display_plate(plate),
-        "result_status": "KHONG_CO_VI_PHAM",
-        "vehicle_type": "",
-        "plate_color": "",
-        "violation_code": "",
-        "violation_text": "",
-        "violation_time": "",
-        "violation_location": "",
-        "detected_by": "",
-        "detected_address": "",
-        "detected_phone": "",
-        "resolved_by": "",
-        "resolved_address": "",
-        "resolved_phone": "",
-        "screenshot_url": screenshot_url,
-        "debug_note": debug_note[:500],
-    }
+def call_local_scraper(plate: str):
+    url = SCRAPER_API_URL.rstrip("/") + "/scrape"
+    r = requests.post(
+        url,
+        json={"plate": plate},
+        timeout=180,
+    )
+    r.raise_for_status()
+    return r.json()
 
 
 def build_error_record(plate, err_text, screenshot_url=""):
@@ -439,223 +324,45 @@ def build_error_record(plate, err_text, screenshot_url=""):
     }
 
 
-def create_browser_page(playwright):
-    browser = playwright.chromium.launch(
-        headless=True,
-        args=[
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-blink-features=AutomationControlled",
-            "--disable-gpu",
-            "--window-size=1536,2048",
-        ]
-    )
+def normalize_records_from_scraper(plate: str, scraper_result: dict):
+    screenshot_drive_url = ""
 
-    context = browser.new_context(
-        viewport={"width": 1536, "height": 2048},
-        user_agent=(
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/122.0.0.0 Safari/537.36"
-        ),
-        locale="vi-VN",
-        timezone_id="Asia/Ho_Chi_Minh",
-        ignore_https_errors=True,
-    )
-
-    page = context.new_page()
-    page.add_init_script("""
-        Object.defineProperty(navigator, 'webdriver', {
-            get: () => undefined
-        });
-    """)
-    page.set_default_timeout(20000)
-    page.set_default_navigation_timeout(90000)
-
-    return browser, context, page
-
-
-def quick_network_check():
-    try:
-        r = requests.get(
-            SOURCE_URL,
-            timeout=25,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/122.0.0.0 Safari/537.36"
-                )
-            },
-        )
-        return True, f"requests_status={r.status_code}"
-    except Exception as e:
-        return False, f"requests_error={str(e)}"
-
-
-def goto_with_retry(page, url, retries=3):
-    last_error = ""
-    for i in range(1, retries + 1):
+    local_path = scraper_result.get("screenshot_path", "")
+    if local_path:
         try:
-            logging.info("[STEP] goto page try %s/%s", i, retries)
-            page.goto(url, wait_until="commit", timeout=90000)
-            page.wait_for_timeout(4000)
-            return True, f"goto_ok_try_{i}"
+            screenshot_drive_url = upload_screenshot_from_local_path(local_path, plate)
         except Exception as e:
-            last_error = str(e)
-            logging.warning("[WARN] goto fail try %s/%s: %s", i, retries, e)
-            page.wait_for_timeout(3000)
-    return False, last_error
+            logging.warning("Upload local screenshot path failed: %s", e)
 
+    records = scraper_result.get("records", []) or []
+    error = scraper_result.get("error", "") or ""
 
-def fetch_plate_data_and_screenshot(plate: str):
-    plate = normalize_plate(plate)
-    screenshot_url = ""
+    if not records and error:
+        return [build_error_record(plate, error, screenshot_drive_url)]
 
-    net_ok, net_note = quick_network_check()
-    if not net_ok:
-        return [build_error_record(plate, f"Lỗi mạng từ Railway tới csgt.vn | {net_note}")]
+    normalized = []
+    for r in records:
+        item = {
+            "plate_display": r.get("plate_display", display_plate(plate)),
+            "result_status": r.get("result_status", ""),
+            "vehicle_type": r.get("vehicle_type", ""),
+            "plate_color": r.get("plate_color", ""),
+            "violation_code": r.get("violation_code", ""),
+            "violation_text": r.get("violation_text", ""),
+            "violation_time": r.get("violation_time", ""),
+            "violation_location": r.get("violation_location", ""),
+            "detected_by": r.get("detected_by", ""),
+            "detected_address": r.get("detected_address", ""),
+            "detected_phone": r.get("detected_phone", ""),
+            "resolved_by": r.get("resolved_by", ""),
+            "resolved_address": r.get("resolved_address", ""),
+            "resolved_phone": r.get("resolved_phone", ""),
+            "screenshot_url": screenshot_drive_url,
+            "debug_note": error[:500] if error else "",
+        }
+        normalized.append(item)
 
-    with sync_playwright() as p:
-        browser, context, page = create_browser_page(p)
-
-        try:
-            ok, goto_note = goto_with_retry(page, SOURCE_URL, retries=3)
-            if not ok:
-                try:
-                    os.makedirs("/tmp/phatnguoi", exist_ok=True)
-                    local_file = f"/tmp/phatnguoi/{safe_filename(plate)}_{int(time.time())}_goto_fail.png"
-                    page.screenshot(path=local_file, full_page=False)
-                    screenshot_url = upload_file_to_drive(local_file, os.path.basename(local_file))
-                except Exception:
-                    pass
-
-                browser.close()
-                return [build_error_record(
-                    plate,
-                    f"Không mở được trang csgt.vn từ Railway | {net_note} | goto_error={goto_note}",
-                    screenshot_url
-                )]
-
-            logging.info("[STEP] find input")
-            input_box = page.locator("input[placeholder*='Nhập biển số xe']").first
-            input_box.wait_for(state="visible", timeout=20000)
-
-            logging.info("[STEP] type plate")
-            input_box.click()
-            try:
-                page.keyboard.press("Control+A")
-            except Exception:
-                pass
-            try:
-                page.keyboard.press("Meta+A")
-            except Exception:
-                pass
-
-            input_box.type(plate, delay=80)
-            page.wait_for_timeout(800)
-
-            logging.info("[STEP] click search")
-            search_btn = page.locator("button:has-text('Tra cứu')").first
-            search_btn.wait_for(state="visible", timeout=15000)
-            search_btn.click()
-
-            page.wait_for_timeout(5000)
-
-            logging.info("[STEP] wait result")
-            found_result = False
-            last_text = ""
-
-            for i in range(30):
-                try:
-                    last_text = page.locator("body").inner_text(timeout=5000) or ""
-                except Exception:
-                    last_text = ""
-
-                signals = [
-                    "Biển số:",
-                    "Đã xử phạt",
-                    "Chưa xử phạt",
-                    "Loại xe:",
-                    "Lỗi vi phạm:",
-                    "Không tìm thấy",
-                    "Không có kết quả",
-                    "Chưa phát hiện lỗi vi phạm",
-                ]
-
-                if any(s in last_text for s in signals):
-                    found_result = True
-                    logging.info("[STEP] found result at loop %s", i + 1)
-                    break
-
-                page.wait_for_timeout(1000)
-
-            os.makedirs("/tmp/phatnguoi", exist_ok=True)
-            local_file = f"/tmp/phatnguoi/{safe_filename(plate)}_{int(time.time())}.png"
-            page.screenshot(path=local_file, full_page=False)
-            screenshot_url = upload_file_to_drive(local_file, os.path.basename(local_file))
-
-            if not found_result:
-                browser.close()
-                return [build_error_record(
-                    plate,
-                    f"Không thấy tín hiệu kết quả | {net_note} | body={last_text[:250]}",
-                    screenshot_url
-                )]
-
-            body_text = last_text
-
-            no_hit_signals = [
-                "Không tìm thấy kết quả",
-                "Không tìm thấy vi phạm",
-                "Chưa phát hiện lỗi vi phạm",
-                "Không có kết quả",
-                "Biển số không có lỗi vi phạm",
-            ]
-            if any(sig.lower() in body_text.lower() for sig in no_hit_signals):
-                browser.close()
-                return [build_no_violation_record(plate, screenshot_url, net_note)]
-
-            blocks = extract_blocks_from_text(body_text)
-            if not blocks and "Biển số:" in body_text and ("Loại xe:" in body_text or "Lỗi vi phạm:" in body_text):
-                blocks = [body_text]
-
-            if not blocks:
-                browser.close()
-                return [build_error_record(
-                    plate,
-                    f"Không parse được block kết quả | {net_note} | body={body_text[:300]}",
-                    screenshot_url
-                )]
-
-            records = []
-            for block in blocks:
-                data = parse_block(block)
-                if not data.get("plate_display"):
-                    data["plate_display"] = display_plate(plate)
-                data["screenshot_url"] = screenshot_url
-                data["debug_note"] = net_note
-                records.append(data)
-
-            browser.close()
-            return records
-
-        except Exception as e:
-            logging.exception("[ERROR] fetch_plate_data_and_screenshot")
-            try:
-                os.makedirs("/tmp/phatnguoi", exist_ok=True)
-                local_file = f"/tmp/phatnguoi/{safe_filename(plate)}_{int(time.time())}_error.png"
-                page.screenshot(path=local_file, full_page=False)
-                screenshot_url = upload_file_to_drive(local_file, os.path.basename(local_file))
-            except Exception:
-                pass
-
-            try:
-                browser.close()
-            except Exception:
-                pass
-
-            return [build_error_record(plate, str(e), screenshot_url)]
+    return normalized
 
 
 def record_to_sheet_row(record, tg_meta, update_id, plate_input, plate_normalized):
@@ -777,10 +484,21 @@ def handle_update(update: dict):
     all_rows = []
     for idx, plate in enumerate(plates, 1):
         logging.info("Tra cứu %s/%s: %s", idx, len(plates), plate)
-        records = fetch_plate_data_and_screenshot(plate)
+
+        try:
+            scraper_result = call_local_scraper(plate)
+            records = normalize_records_from_scraper(plate, scraper_result)
+        except Exception as e:
+            logging.exception("Call local scraper failed")
+            records = [build_error_record(
+                plate,
+                f"Không gọi được scraper local: {str(e)}"
+            )]
 
         for r in records:
-            all_rows.append(record_to_sheet_row(r, tg_meta, update_id, plate, normalize_plate(plate)))
+            all_rows.append(
+                record_to_sheet_row(r, tg_meta, update_id, plate, normalize_plate(plate))
+            )
 
         tg_send_message(chat_id, format_plate_message(plate, records))
         time.sleep(1)
