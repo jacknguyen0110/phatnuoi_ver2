@@ -5,15 +5,12 @@ import time
 import queue
 import logging
 import threading
-import tempfile
 from datetime import datetime
 
 import requests
 import gspread
 from flask import Flask, request, jsonify
 from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
 
 
 APP_NAME = "Tra cứu phạt nguội bot"
@@ -24,8 +21,7 @@ WEBHOOK_BASE_URL = os.getenv("WEBHOOK_BASE_URL", "").strip()
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "").strip()
 GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "Phạt Nguội").strip()
-GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "").strip()
-SCRAPER_API_URL = os.getenv("SCRAPER_API_URL", "").strip()  # ví dụ: https://abc.ngrok-free.app
+SCRAPER_API_URL = os.getenv("SCRAPER_API_URL", "").strip()
 PORT = int(os.getenv("PORT", "8080"))
 
 if not TELEGRAM_BOT_TOKEN:
@@ -34,8 +30,6 @@ if not GOOGLE_SERVICE_ACCOUNT_JSON:
     raise RuntimeError("Thiếu GOOGLE_SERVICE_ACCOUNT_JSON")
 if not GOOGLE_SHEET_ID:
     raise RuntimeError("Thiếu GOOGLE_SHEET_ID")
-if not GOOGLE_DRIVE_FOLDER_ID:
-    raise RuntimeError("Thiếu GOOGLE_DRIVE_FOLDER_ID")
 if not SCRAPER_API_URL:
     raise RuntimeError("Thiếu SCRAPER_API_URL")
 
@@ -79,9 +73,7 @@ app = Flask(__name__)
 job_queue = queue.Queue()
 processed_update_ids = set()
 processed_update_ids_lock = threading.Lock()
-
 _gspread_client = None
-_drive_service = None
 _worksheet = None
 
 
@@ -143,11 +135,6 @@ def chunk_text(text: str, size: int = 3500):
     return chunks
 
 
-def safe_filename(text: str):
-    text = re.sub(r"[^A-Za-z0-9._-]+", "_", text or "")
-    return text[:150].strip("_") or "file"
-
-
 def tg_send_message(chat_id, text):
     for part in chunk_text(text):
         try:
@@ -162,7 +149,6 @@ def tg_send_message(chat_id, text):
 
 def tg_set_webhook():
     if not WEBHOOK_BASE_URL:
-        logging.warning("Chưa có WEBHOOK_BASE_URL, bỏ qua setWebhook")
         return
 
     webhook_url = WEBHOOK_BASE_URL.rstrip("/") + "/telegram/webhook"
@@ -179,10 +165,7 @@ def get_service_account_info():
 
 
 def get_credentials():
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
     info = get_service_account_info()
     return Credentials.from_service_account_info(info, scopes=scopes)
 
@@ -195,17 +178,8 @@ def get_gspread_client():
     return _gspread_client
 
 
-def get_drive_service():
-    global _drive_service
-    if _drive_service is None:
-        creds = get_credentials()
-        _drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
-    return _drive_service
-
-
 def get_worksheet():
     global _worksheet
-
     if _worksheet is not None:
         return _worksheet
 
@@ -236,62 +210,6 @@ def append_sheet_rows(rows):
     ws.append_rows(rows, value_input_option="RAW")
 
 
-def upload_file_to_drive(local_path: str, filename: str):
-    service = get_drive_service()
-
-    file_metadata = {
-        "name": filename,
-        "parents": [GOOGLE_DRIVE_FOLDER_ID],
-    }
-    media = MediaFileUpload(local_path, mimetype="image/png", resumable=False)
-
-    created = service.files().create(
-        body=file_metadata,
-        media_body=media,
-        fields="id,name,webViewLink"
-    ).execute()
-
-    file_id = created["id"]
-
-    service.permissions().create(
-        fileId=file_id,
-        body={"role": "reader", "type": "anyone"},
-    ).execute()
-
-    info = service.files().get(fileId=file_id, fields="id,name,webViewLink").execute()
-    return info.get("webViewLink", "")
-
-
-def upload_screenshot_from_local_path(local_screenshot_path: str, plate: str):
-    if not local_screenshot_path or not os.path.exists(local_screenshot_path):
-        return ""
-
-    filename = f"{safe_filename(plate)}_{int(time.time())}.png"
-    return upload_file_to_drive(local_screenshot_path, filename)
-
-
-def upload_screenshot_from_url(file_url: str, plate: str):
-    if not file_url:
-        return ""
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
-        tmp_path = tmp.name
-
-    try:
-        r = requests.get(file_url, timeout=120)
-        r.raise_for_status()
-        with open(tmp_path, "wb") as f:
-            f.write(r.content)
-
-        filename = f"{safe_filename(plate)}_{int(time.time())}.png"
-        return upload_file_to_drive(tmp_path, filename)
-    finally:
-        try:
-            os.remove(tmp_path)
-        except Exception:
-            pass
-
-
 def call_local_scraper(plate: str):
     url = SCRAPER_API_URL.rstrip("/") + "/scrape"
     r = requests.post(
@@ -303,7 +221,7 @@ def call_local_scraper(plate: str):
     return r.json()
 
 
-def build_error_record(plate, err_text, screenshot_url=""):
+def build_error_record(plate, err_text):
     return {
         "plate_display": display_plate(plate),
         "result_status": f"LOI_TRA_CUU: {err_text[:250]}",
@@ -319,26 +237,17 @@ def build_error_record(plate, err_text, screenshot_url=""):
         "resolved_by": "",
         "resolved_address": "",
         "resolved_phone": "",
-        "screenshot_url": screenshot_url,
+        "screenshot_url": "",
         "debug_note": err_text[:500],
     }
 
 
 def normalize_records_from_scraper(plate: str, scraper_result: dict):
-    screenshot_drive_url = ""
-
-    local_path = scraper_result.get("screenshot_path", "")
-    if local_path:
-        try:
-            screenshot_drive_url = upload_screenshot_from_local_path(local_path, plate)
-        except Exception as e:
-            logging.warning("Upload local screenshot path failed: %s", e)
-
     records = scraper_result.get("records", []) or []
     error = scraper_result.get("error", "") or ""
 
     if not records and error:
-        return [build_error_record(plate, error, screenshot_drive_url)]
+        return [build_error_record(plate, error)]
 
     normalized = []
     for r in records:
@@ -357,7 +266,7 @@ def normalize_records_from_scraper(plate: str, scraper_result: dict):
             "resolved_by": r.get("resolved_by", ""),
             "resolved_address": r.get("resolved_address", ""),
             "resolved_phone": r.get("resolved_phone", ""),
-            "screenshot_url": screenshot_drive_url,
+            "screenshot_url": "",
             "debug_note": error[:500] if error else "",
         }
         normalized.append(item)
@@ -399,16 +308,13 @@ def format_plate_message(plate, records):
     title = f"Biển số: {display_plate(plate)}"
 
     if len(records) == 1 and records[0]["result_status"] == "KHONG_CO_VI_PHAM":
-        msg = f"{title}\nKết quả: Không có vi phạm."
-        if records[0].get("screenshot_url"):
-            msg += f"\nẢnh kết quả: {records[0]['screenshot_url']}"
-        return msg
+        return f"{title}\nKết quả: Không có vi phạm."
+
+    if len(records) == 1 and records[0]["result_status"] == "KHONG_CO_DU_LIEU_VI_PHAM":
+        return f"{title}\nKết quả: Không tìm thấy dữ liệu vi phạm. Vui lòng thử lại sau."
 
     if len(records) == 1 and str(records[0]["result_status"]).startswith("LOI_TRA_CUU"):
-        msg = f"{title}\nKết quả: {records[0]['result_status']}"
-        if records[0].get("screenshot_url"):
-            msg += f"\nẢnh debug: {records[0]['screenshot_url']}"
-        return msg
+        return f"{title}\nKết quả: {records[0]['result_status']}"
 
     lines = [title, f"Số vi phạm: {len(records)}"]
     for i, r in enumerate(records, 1):
@@ -430,11 +336,6 @@ def format_plate_message(plate, records):
             lines.append(f"Đơn vị phát hiện: {r['detected_by']}")
         if r.get("resolved_by"):
             lines.append(f"Đơn vị giải quyết: {r['resolved_by']}")
-
-    if records and records[0].get("screenshot_url"):
-        lines.append("")
-        lines.append(f"Ảnh kết quả: {records[0]['screenshot_url']}")
-
     return "\n".join(lines)
 
 
@@ -468,7 +369,7 @@ def handle_update(update: dict):
     if not plates:
         tg_send_message(
             chat_id,
-            "Không đọc được biển số.\nVui lòng gửi mỗi dòng 1 biển số, ví dụ:\n50H12314\n51L91000"
+            "Không đọc được biển số.\nVui lòng gửi mỗi dòng 1 biển số."
         )
         return
 
