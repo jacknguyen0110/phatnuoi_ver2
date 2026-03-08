@@ -16,9 +16,6 @@ from googleapiclient.http import MediaFileUpload
 from playwright.sync_api import sync_playwright
 
 
-# =========================
-# CONFIG
-# =========================
 APP_NAME = "Tra cứu phạt nguội bot"
 SOURCE_URL = "https://csgt.vn/tra-cuu-phat-nguoi"
 
@@ -76,9 +73,6 @@ logging.basicConfig(
 
 app = Flask(__name__)
 
-# =========================
-# GLOBAL STATE
-# =========================
 job_queue = queue.Queue()
 processed_update_ids = set()
 processed_update_ids_lock = threading.Lock()
@@ -88,9 +82,6 @@ _drive_service = None
 _worksheet = None
 
 
-# =========================
-# UTILS
-# =========================
 def now_str():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -158,18 +149,12 @@ def normalize_spaces(s: str) -> str:
     return re.sub(r"[ \t]+", " ", (s or "").strip())
 
 
-# =========================
-# TELEGRAM
-# =========================
 def tg_send_message(chat_id, text):
     for part in chunk_text(text):
         try:
             requests.post(
                 f"{TELEGRAM_API}/sendMessage",
-                json={
-                    "chat_id": chat_id,
-                    "text": part,
-                },
+                json={"chat_id": chat_id, "text": part},
                 timeout=30,
             )
         except Exception as e:
@@ -190,9 +175,6 @@ def tg_set_webhook():
     logging.info("setWebhook response: %s", r.text)
 
 
-# =========================
-# GOOGLE AUTH / SHEETS / DRIVE
-# =========================
 def get_service_account_info():
     return json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
 
@@ -281,9 +263,6 @@ def upload_file_to_drive(local_path: str, filename: str):
     return info.get("webViewLink", "")
 
 
-# =========================
-# PARSE RESULT BLOCKS
-# =========================
 def extract_blocks_from_text(page_text: str):
     text = page_text or ""
     start = text.find("Biển số:")
@@ -418,7 +397,7 @@ def parse_block(block_text: str):
     return data
 
 
-def build_no_violation_record(plate, screenshot_url=""):
+def build_no_violation_record(plate, screenshot_url="", debug_note=""):
     return {
         "plate_display": display_plate(plate),
         "result_status": "KHONG_CO_VI_PHAM",
@@ -435,7 +414,7 @@ def build_no_violation_record(plate, screenshot_url=""):
         "resolved_address": "",
         "resolved_phone": "",
         "screenshot_url": screenshot_url,
-        "debug_note": "",
+        "debug_note": debug_note[:500],
     }
 
 
@@ -460,9 +439,6 @@ def build_error_record(plate, err_text, screenshot_url=""):
     }
 
 
-# =========================
-# PLAYWRIGHT
-# =========================
 def create_browser_page(playwright):
     browser = playwright.chromium.launch(
         headless=True,
@@ -484,39 +460,88 @@ def create_browser_page(playwright):
         ),
         locale="vi-VN",
         timezone_id="Asia/Ho_Chi_Minh",
+        ignore_https_errors=True,
     )
 
     page = context.new_page()
-
     page.add_init_script("""
         Object.defineProperty(navigator, 'webdriver', {
             get: () => undefined
         });
     """)
-
-    page.set_default_timeout(15000)
-    page.set_default_navigation_timeout(30000)
+    page.set_default_timeout(20000)
+    page.set_default_navigation_timeout(90000)
 
     return browser, context, page
+
+
+def quick_network_check():
+    try:
+        r = requests.get(
+            SOURCE_URL,
+            timeout=25,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/122.0.0.0 Safari/537.36"
+                )
+            },
+        )
+        return True, f"requests_status={r.status_code}"
+    except Exception as e:
+        return False, f"requests_error={str(e)}"
+
+
+def goto_with_retry(page, url, retries=3):
+    last_error = ""
+    for i in range(1, retries + 1):
+        try:
+            logging.info("[STEP] goto page try %s/%s", i, retries)
+            page.goto(url, wait_until="commit", timeout=90000)
+            page.wait_for_timeout(4000)
+            return True, f"goto_ok_try_{i}"
+        except Exception as e:
+            last_error = str(e)
+            logging.warning("[WARN] goto fail try %s/%s: %s", i, retries, e)
+            page.wait_for_timeout(3000)
+    return False, last_error
 
 
 def fetch_plate_data_and_screenshot(plate: str):
     plate = normalize_plate(plate)
     screenshot_url = ""
 
+    net_ok, net_note = quick_network_check()
+    if not net_ok:
+        return [build_error_record(plate, f"Lỗi mạng từ Railway tới csgt.vn | {net_note}")]
+
     with sync_playwright() as p:
         browser, context, page = create_browser_page(p)
 
         try:
-            logging.info("[STEP] goto page")
-            page.goto(SOURCE_URL, wait_until="domcontentloaded", timeout=30000)
-            page.wait_for_timeout(2000)
+            ok, goto_note = goto_with_retry(page, SOURCE_URL, retries=3)
+            if not ok:
+                try:
+                    os.makedirs("/tmp/phatnguoi", exist_ok=True)
+                    local_file = f"/tmp/phatnguoi/{safe_filename(plate)}_{int(time.time())}_goto_fail.png"
+                    page.screenshot(path=local_file, full_page=False)
+                    screenshot_url = upload_file_to_drive(local_file, os.path.basename(local_file))
+                except Exception:
+                    pass
+
+                browser.close()
+                return [build_error_record(
+                    plate,
+                    f"Không mở được trang csgt.vn từ Railway | {net_note} | goto_error={goto_note}",
+                    screenshot_url
+                )]
 
             logging.info("[STEP] find input")
             input_box = page.locator("input[placeholder*='Nhập biển số xe']").first
-            input_box.wait_for(state="visible", timeout=15000)
+            input_box.wait_for(state="visible", timeout=20000)
 
-            logging.info("[STEP] fill plate")
+            logging.info("[STEP] type plate")
             input_box.click()
             try:
                 page.keyboard.press("Control+A")
@@ -528,20 +553,20 @@ def fetch_plate_data_and_screenshot(plate: str):
                 pass
 
             input_box.type(plate, delay=80)
-            page.wait_for_timeout(500)
+            page.wait_for_timeout(800)
 
             logging.info("[STEP] click search")
             search_btn = page.locator("button:has-text('Tra cứu')").first
-            search_btn.wait_for(state="visible", timeout=10000)
+            search_btn.wait_for(state="visible", timeout=15000)
             search_btn.click()
 
-            page.wait_for_timeout(3000)
+            page.wait_for_timeout(5000)
 
-            logging.info("[STEP] wait result signals")
+            logging.info("[STEP] wait result")
             found_result = False
             last_text = ""
 
-            for i in range(25):
+            for i in range(30):
                 try:
                     last_text = page.locator("body").inner_text(timeout=5000) or ""
                 except Exception:
@@ -560,24 +585,21 @@ def fetch_plate_data_and_screenshot(plate: str):
 
                 if any(s in last_text for s in signals):
                     found_result = True
-                    logging.info("[STEP] found result signal at loop %s", i + 1)
+                    logging.info("[STEP] found result at loop %s", i + 1)
                     break
 
                 page.wait_for_timeout(1000)
 
             os.makedirs("/tmp/phatnguoi", exist_ok=True)
             local_file = f"/tmp/phatnguoi/{safe_filename(plate)}_{int(time.time())}.png"
-
-            logging.info("[STEP] screenshot viewport")
             page.screenshot(path=local_file, full_page=False)
             screenshot_url = upload_file_to_drive(local_file, os.path.basename(local_file))
 
             if not found_result:
-                logging.warning("[FAIL] no result signal. body sample: %s", last_text[:1000])
                 browser.close()
                 return [build_error_record(
                     plate,
-                    f"Không thấy tín hiệu kết quả. body={last_text[:200]}",
+                    f"Không thấy tín hiệu kết quả | {net_note} | body={last_text[:250]}",
                     screenshot_url
                 )]
 
@@ -592,19 +614,17 @@ def fetch_plate_data_and_screenshot(plate: str):
             ]
             if any(sig.lower() in body_text.lower() for sig in no_hit_signals):
                 browser.close()
-                return [build_no_violation_record(plate, screenshot_url)]
+                return [build_no_violation_record(plate, screenshot_url, net_note)]
 
             blocks = extract_blocks_from_text(body_text)
-            if not blocks:
-                if "Biển số:" in body_text and ("Loại xe:" in body_text or "Lỗi vi phạm:" in body_text):
-                    blocks = [body_text]
+            if not blocks and "Biển số:" in body_text and ("Loại xe:" in body_text or "Lỗi vi phạm:" in body_text):
+                blocks = [body_text]
 
             if not blocks:
-                logging.warning("[FAIL] parse block failed. body sample: %s", body_text[:1500])
                 browser.close()
                 return [build_error_record(
                     plate,
-                    f"Không parse được block kết quả. body={body_text[:300]}",
+                    f"Không parse được block kết quả | {net_note} | body={body_text[:300]}",
                     screenshot_url
                 )]
 
@@ -614,6 +634,7 @@ def fetch_plate_data_and_screenshot(plate: str):
                 if not data.get("plate_display"):
                     data["plate_display"] = display_plate(plate)
                 data["screenshot_url"] = screenshot_url
+                data["debug_note"] = net_note
                 records.append(data)
 
             browser.close()
@@ -637,9 +658,6 @@ def fetch_plate_data_and_screenshot(plate: str):
             return [build_error_record(plate, str(e), screenshot_url)]
 
 
-# =========================
-# FORMAT OUTPUT
-# =========================
 def record_to_sheet_row(record, tg_meta, update_id, plate_input, plate_normalized):
     return [
         now_str(),
@@ -713,9 +731,6 @@ def format_plate_message(plate, records):
     return "\n".join(lines)
 
 
-# =========================
-# CORE LOGIC
-# =========================
 def handle_update(update: dict):
     update_id = update.get("update_id")
     message = update.get("message") or update.get("edited_message") or {}
@@ -762,16 +777,12 @@ def handle_update(update: dict):
     all_rows = []
     for idx, plate in enumerate(plates, 1):
         logging.info("Tra cứu %s/%s: %s", idx, len(plates), plate)
-
         records = fetch_plate_data_and_screenshot(plate)
 
         for r in records:
-            all_rows.append(
-                record_to_sheet_row(r, tg_meta, update_id, plate, normalize_plate(plate))
-            )
+            all_rows.append(record_to_sheet_row(r, tg_meta, update_id, plate, normalize_plate(plate)))
 
-        msg = format_plate_message(plate, records)
-        tg_send_message(chat_id, msg)
+        tg_send_message(chat_id, format_plate_message(plate, records))
         time.sleep(1)
 
     append_sheet_rows(all_rows)
@@ -800,16 +811,9 @@ worker_thread = threading.Thread(target=worker_loop, daemon=True)
 worker_thread.start()
 
 
-# =========================
-# ROUTES
-# =========================
 @app.route("/", methods=["GET"])
 def home():
-    return jsonify({
-        "ok": True,
-        "app": APP_NAME,
-        "time": now_str()
-    })
+    return jsonify({"ok": True, "app": APP_NAME, "time": now_str()})
 
 
 @app.route("/health", methods=["GET"])
@@ -841,13 +845,11 @@ def telegram_webhook():
             return jsonify({"ok": True})
 
         processed_update_ids.add(update_id)
-
         if len(processed_update_ids) > 5000:
             processed_update_ids.clear()
             processed_update_ids.add(update_id)
 
     job_queue.put(update)
-
     return jsonify({"ok": True})
 
 
