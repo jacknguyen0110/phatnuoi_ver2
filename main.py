@@ -1,6 +1,5 @@
 import os
 import re
-import io
 import json
 import time
 import queue
@@ -14,7 +13,7 @@ from flask import Flask, request, jsonify
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import sync_playwright
 
 
 # =========================
@@ -29,7 +28,6 @@ GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "").strip()
 GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "Phạt Nguội").strip()
 GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "").strip()
-
 PORT = int(os.getenv("PORT", "8080"))
 
 if not TELEGRAM_BOT_TOKEN:
@@ -68,6 +66,7 @@ HEADERS = [
     "resolved_phone",
     "screenshot_drive_url",
     "source_url",
+    "debug_note",
 ]
 
 logging.basicConfig(
@@ -78,15 +77,19 @@ logging.basicConfig(
 app = Flask(__name__)
 
 # =========================
-# GLOBAL WORKER
+# GLOBAL STATE
 # =========================
 job_queue = queue.Queue()
 processed_update_ids = set()
 processed_update_ids_lock = threading.Lock()
 
+_gspread_client = None
+_drive_service = None
+_worksheet = None
+
 
 # =========================
-# UTIL
+# UTILS
 # =========================
 def now_str():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -151,6 +154,10 @@ def safe_filename(text: str):
     return text[:150].strip("_") or "file"
 
 
+def normalize_spaces(s: str) -> str:
+    return re.sub(r"[ \t]+", " ", (s or "").strip())
+
+
 # =========================
 # TELEGRAM
 # =========================
@@ -159,7 +166,10 @@ def tg_send_message(chat_id, text):
         try:
             requests.post(
                 f"{TELEGRAM_API}/sendMessage",
-                json={"chat_id": chat_id, "text": part},
+                json={
+                    "chat_id": chat_id,
+                    "text": part,
+                },
                 timeout=30,
             )
         except Exception as e:
@@ -181,25 +191,19 @@ def tg_set_webhook():
 
 
 # =========================
-# GOOGLE AUTH
+# GOOGLE AUTH / SHEETS / DRIVE
 # =========================
-_scopes = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive",
-]
-
-_gspread_client = None
-_drive_service = None
-_worksheet = None
-
-
 def get_service_account_info():
     return json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
 
 
 def get_credentials():
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
     info = get_service_account_info()
-    return Credentials.from_service_account_info(info, scopes=_scopes)
+    return Credentials.from_service_account_info(info, scopes=scopes)
 
 
 def get_gspread_client():
@@ -220,6 +224,7 @@ def get_drive_service():
 
 def get_worksheet():
     global _worksheet
+
     if _worksheet is not None:
         return _worksheet
 
@@ -235,8 +240,7 @@ def get_worksheet():
     if not values:
         ws.append_row(HEADERS, value_input_option="RAW")
     else:
-        first_row = values[0]
-        if first_row != HEADERS:
+        if values[0] != HEADERS:
             ws.clear()
             ws.append_row(HEADERS, value_input_option="RAW")
 
@@ -268,7 +272,6 @@ def upload_file_to_drive(local_path: str, filename: str):
 
     file_id = created["id"]
 
-    # cho ai có link đều xem được
     service.permissions().create(
         fileId=file_id,
         body={"role": "reader", "type": "anyone"},
@@ -279,26 +282,30 @@ def upload_file_to_drive(local_path: str, filename: str):
 
 
 # =========================
-# PARSE RESULT
+# PARSE RESULT BLOCKS
 # =========================
-def normalize_spaces(s: str) -> str:
-    return re.sub(r"[ \t]+", " ", (s or "").strip())
-
-
 def extract_blocks_from_text(page_text: str):
     text = page_text or ""
     start = text.find("Biển số:")
     if start == -1:
         return []
+
     text = text[start:]
     parts = re.split(r"(?=Biển số:\s*)", text)
     blocks = []
+
     for part in parts:
         part = part.strip()
         if not part:
             continue
-        if ("Loại xe:" in part or "Chi tiết vi phạm" in part or "Thông tin xử lý" in part):
+        if (
+            "Loại xe:" in part
+            or "Chi tiết vi phạm" in part
+            or "Thông tin xử lý" in part
+            or "Lỗi vi phạm:" in part
+        ):
             blocks.append(part)
+
     return blocks
 
 
@@ -319,6 +326,8 @@ def parse_block(block_text: str):
         "resolved_by": "",
         "resolved_address": "",
         "resolved_phone": "",
+        "screenshot_url": "",
+        "debug_note": "",
     }
 
     current = None
@@ -426,6 +435,7 @@ def build_no_violation_record(plate, screenshot_url=""):
         "resolved_address": "",
         "resolved_phone": "",
         "screenshot_url": screenshot_url,
+        "debug_note": "",
     }
 
 
@@ -446,74 +456,132 @@ def build_error_record(plate, err_text, screenshot_url=""):
         "resolved_address": "",
         "resolved_phone": "",
         "screenshot_url": screenshot_url,
+        "debug_note": err_text[:500],
     }
 
 
 # =========================
-# SCRAPER
+# PLAYWRIGHT
 # =========================
+def create_browser_page(playwright):
+    browser = playwright.chromium.launch(
+        headless=True,
+        args=[
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-blink-features=AutomationControlled",
+            "--disable-gpu",
+            "--window-size=1536,2048",
+        ]
+    )
+
+    context = browser.new_context(
+        viewport={"width": 1536, "height": 2048},
+        user_agent=(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
+        ),
+        locale="vi-VN",
+        timezone_id="Asia/Ho_Chi_Minh",
+    )
+
+    page = context.new_page()
+
+    page.add_init_script("""
+        Object.defineProperty(navigator, 'webdriver', {
+            get: () => undefined
+        });
+    """)
+
+    page.set_default_timeout(15000)
+    page.set_default_navigation_timeout(30000)
+
+    return browser, context, page
+
+
 def fetch_plate_data_and_screenshot(plate: str):
-    """
-    Tra cứu 1 biển số:
-    - screenshot kết quả
-    - upload Drive
-    - parse DOM text
-    """
     plate = normalize_plate(plate)
     screenshot_url = ""
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-            ]
-        )
-        page = browser.new_page(viewport={"width": 1536, "height": 2400})
+        browser, context, page = create_browser_page(p)
 
         try:
+            logging.info("[STEP] goto page")
             page.goto(SOURCE_URL, wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(2000)
 
+            logging.info("[STEP] find input")
             input_box = page.locator("input[placeholder*='Nhập biển số xe']").first
-            input_box.wait_for(timeout=10000)
+            input_box.wait_for(state="visible", timeout=15000)
+
+            logging.info("[STEP] fill plate")
             input_box.click()
-            input_box.fill(plate)
+            try:
+                page.keyboard.press("Control+A")
+            except Exception:
+                pass
+            try:
+                page.keyboard.press("Meta+A")
+            except Exception:
+                pass
 
-            page.locator("button:has-text('Tra cứu')").first.click()
+            input_box.type(plate, delay=80)
+            page.wait_for_timeout(500)
 
-            # Chờ tín hiệu kết quả thay vì chờ networkidle quá lâu
+            logging.info("[STEP] click search")
+            search_btn = page.locator("button:has-text('Tra cứu')").first
+            search_btn.wait_for(state="visible", timeout=10000)
+            search_btn.click()
+
+            page.wait_for_timeout(3000)
+
+            logging.info("[STEP] wait result signals")
             found_result = False
-            start = time.time()
-            while time.time() - start < 20:
-                body_text = page.locator("body").inner_text(timeout=5000)
-                if (
-                    "Biển số:" in body_text
-                    or "Không tìm thấy" in body_text
-                    or "Không có kết quả" in body_text
-                    or "Chưa phát hiện lỗi vi phạm" in body_text
-                    or "Loại xe:" in body_text
-                    or "Lỗi vi phạm:" in body_text
-                ):
+            last_text = ""
+
+            for i in range(25):
+                try:
+                    last_text = page.locator("body").inner_text(timeout=5000) or ""
+                except Exception:
+                    last_text = ""
+
+                signals = [
+                    "Biển số:",
+                    "Đã xử phạt",
+                    "Chưa xử phạt",
+                    "Loại xe:",
+                    "Lỗi vi phạm:",
+                    "Không tìm thấy",
+                    "Không có kết quả",
+                    "Chưa phát hiện lỗi vi phạm",
+                ]
+
+                if any(s in last_text for s in signals):
                     found_result = True
+                    logging.info("[STEP] found result signal at loop %s", i + 1)
                     break
+
                 page.wait_for_timeout(1000)
 
-            # chụp ảnh dù có kết quả hay không
             os.makedirs("/tmp/phatnguoi", exist_ok=True)
             local_file = f"/tmp/phatnguoi/{safe_filename(plate)}_{int(time.time())}.png"
-            page.screenshot(path=local_file, full_page=True)
-            screenshot_url = upload_file_to_drive(
-                local_file,
-                os.path.basename(local_file)
-            )
+
+            logging.info("[STEP] screenshot viewport")
+            page.screenshot(path=local_file, full_page=False)
+            screenshot_url = upload_file_to_drive(local_file, os.path.basename(local_file))
 
             if not found_result:
+                logging.warning("[FAIL] no result signal. body sample: %s", last_text[:1000])
                 browser.close()
-                return [build_error_record(plate, "Timeout khi chờ kết quả trên trang", screenshot_url)]
+                return [build_error_record(
+                    plate,
+                    f"Không thấy tín hiệu kết quả. body={last_text[:200]}",
+                    screenshot_url
+                )]
 
-            body_text = page.locator("body").inner_text(timeout=5000) or ""
+            body_text = last_text
 
             no_hit_signals = [
                 "Không tìm thấy kết quả",
@@ -532,8 +600,13 @@ def fetch_plate_data_and_screenshot(plate: str):
                     blocks = [body_text]
 
             if not blocks:
+                logging.warning("[FAIL] parse block failed. body sample: %s", body_text[:1500])
                 browser.close()
-                return [build_error_record(plate, "Không parse được block kết quả", screenshot_url)]
+                return [build_error_record(
+                    plate,
+                    f"Không parse được block kết quả. body={body_text[:300]}",
+                    screenshot_url
+                )]
 
             records = []
             for block in blocks:
@@ -546,33 +619,26 @@ def fetch_plate_data_and_screenshot(plate: str):
             browser.close()
             return records
 
-        except PlaywrightTimeoutError:
-            try:
-                os.makedirs("/tmp/phatnguoi", exist_ok=True)
-                local_file = f"/tmp/phatnguoi/{safe_filename(plate)}_{int(time.time())}_timeout.png"
-                page.screenshot(path=local_file, full_page=True)
-                screenshot_url = upload_file_to_drive(local_file, os.path.basename(local_file))
-            except Exception:
-                pass
-
-            browser.close()
-            return [build_error_record(plate, "Playwright timeout", screenshot_url)]
-
         except Exception as e:
+            logging.exception("[ERROR] fetch_plate_data_and_screenshot")
             try:
                 os.makedirs("/tmp/phatnguoi", exist_ok=True)
                 local_file = f"/tmp/phatnguoi/{safe_filename(plate)}_{int(time.time())}_error.png"
-                page.screenshot(path=local_file, full_page=True)
+                page.screenshot(path=local_file, full_page=False)
                 screenshot_url = upload_file_to_drive(local_file, os.path.basename(local_file))
             except Exception:
                 pass
 
-            browser.close()
+            try:
+                browser.close()
+            except Exception:
+                pass
+
             return [build_error_record(plate, str(e), screenshot_url)]
 
 
 # =========================
-# FORMAT
+# FORMAT OUTPUT
 # =========================
 def record_to_sheet_row(record, tg_meta, update_id, plate_input, plate_normalized):
     return [
@@ -600,6 +666,7 @@ def record_to_sheet_row(record, tg_meta, update_id, plate_input, plate_normalize
         record.get("resolved_phone", ""),
         record.get("screenshot_url", ""),
         SOURCE_URL,
+        record.get("debug_note", ""),
     ]
 
 
@@ -647,7 +714,7 @@ def format_plate_message(plate, records):
 
 
 # =========================
-# BUSINESS
+# CORE LOGIC
 # =========================
 def handle_update(update: dict):
     update_id = update.get("update_id")
@@ -667,10 +734,11 @@ def handle_update(update: dict):
     if not chat_id:
         return
 
-    if text.strip().lower() in ("/start", "start"):
+    cmd = text.strip().lower()
+    if cmd in ("/start", "start"):
         tg_send_message(
             chat_id,
-            "Gửi biển số cần tra cứu, mỗi dòng 1 biển số.\n\nVí dụ:\n50H12314\n51L91000"
+            "Gửi biển số cần tra cứu, mỗi dòng 1 biển số.\n\nVí dụ:\n50H12314\n51L91000\n60H12916"
         )
         return
 
@@ -694,6 +762,7 @@ def handle_update(update: dict):
     all_rows = []
     for idx, plate in enumerate(plates, 1):
         logging.info("Tra cứu %s/%s: %s", idx, len(plates), plate)
+
         records = fetch_plate_data_and_screenshot(plate)
 
         for r in records:
@@ -736,7 +805,11 @@ worker_thread.start()
 # =========================
 @app.route("/", methods=["GET"])
 def home():
-    return jsonify({"ok": True, "app": APP_NAME, "time": now_str()})
+    return jsonify({
+        "ok": True,
+        "app": APP_NAME,
+        "time": now_str()
+    })
 
 
 @app.route("/health", methods=["GET"])
@@ -766,16 +839,15 @@ def telegram_webhook():
         if update_id in processed_update_ids:
             logging.info("Duplicate update skipped: %s", update_id)
             return jsonify({"ok": True})
+
         processed_update_ids.add(update_id)
 
-        # dọn bớt set cho đỡ phình
         if len(processed_update_ids) > 5000:
             processed_update_ids.clear()
             processed_update_ids.add(update_id)
 
     job_queue.put(update)
 
-    # trả OK ngay để Telegram không retry
     return jsonify({"ok": True})
 
 
